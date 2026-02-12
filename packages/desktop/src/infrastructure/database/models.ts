@@ -41,6 +41,13 @@ export interface Project {
   id: number;
   name: string;
   path: string;
+  location_type?: 'local' | 'remote';
+  remote_host?: string | null;
+  remote_user?: string | null;
+  remote_port?: number | null;
+  remote_path?: string | null;
+  remote_auth_type?: 'ssh-agent' | 'keyfile' | null;
+  remote_key_path?: string | null;
   system_prompt?: string | null;
   run_script?: string | null;
   build_script?: string | null;

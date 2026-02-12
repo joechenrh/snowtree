@@ -2,14 +2,24 @@ import { EventEmitter } from 'events';
 import * as pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { getShellPath } from '../../infrastructure/command/shellPath';
 import { ShellDetector } from '../../infrastructure/command/shellDetector';
+import { escapeShellArg } from '../../infrastructure/security/shellEscape';
 import * as os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+
+export interface RemoteTerminalOptions {
+  host: string;
+  user?: string | null;
+  port?: number | null;
+  authType?: 'ssh-agent' | 'keyfile' | null;
+  keyPath?: string | null;
+}
 
 interface TerminalSession {
   pty: pty.IPty;
   sessionId: string;
   cwd: string;
+  remote?: RemoteTerminalOptions;
 }
 
 export class TerminalManager extends EventEmitter {
@@ -21,7 +31,7 @@ export class TerminalManager extends EventEmitter {
     this.setMaxListeners(50);
   }
 
-  async createTerminalSession(sessionId: string, worktreePath: string): Promise<void> {
+  async createTerminalSession(sessionId: string, worktreePath: string, remote?: RemoteTerminalOptions): Promise<void> {
     // Check if session already exists
     if (this.terminalSessions.has(sessionId)) {
       return;
@@ -35,27 +45,58 @@ export class TerminalManager extends EventEmitter {
     const shellInfo = ShellDetector.getDefaultShell();
     console.log(`Using shell: ${shellInfo.path} (${shellInfo.name})`);
     
-    // Create a new PTY instance with proper terminal settings
-    const ptyProcess = pty.spawn(shellInfo.path, shellInfo.args || [], {
-      name: 'xterm-256color',  // Better terminal emulation
-      cwd: worktreePath,
-      cols: 80,
-      rows: 24,
-      env: {
-        ...process.env,
-        PATH: shellPath,
-        WORKTREE_PATH: worktreePath,
-        TERM: 'xterm-256color',  // Ensure TERM is set for color support
-        COLORTERM: 'truecolor',  // Enable 24-bit color
-        LANG: process.env.LANG || 'en_US.UTF-8',  // Set locale for proper character handling
-      },
-    });
+    const ptyProcess = (() => {
+      if (remote?.host) {
+        const sshArgs: string[] = ['-tt', '-o', 'BatchMode=yes'];
+        if (typeof remote.port === 'number' && remote.port > 0) {
+          sshArgs.push('-p', String(remote.port));
+        }
+        if (remote.authType === 'keyfile' && remote.keyPath) {
+          sshArgs.push('-i', remote.keyPath);
+        }
+
+        const target = remote.user ? `${remote.user}@${remote.host}` : remote.host;
+        const remoteScript = `cd ${escapeShellArg(worktreePath)} && exec "$SHELL" -l`;
+        sshArgs.push(target, 'sh', '-lc', remoteScript);
+
+        return pty.spawn('ssh', sshArgs, {
+          name: 'xterm-256color',
+          cwd: process.cwd(),
+          cols: 80,
+          rows: 24,
+          env: {
+            ...process.env,
+            PATH: shellPath,
+            TERM: 'xterm-256color',
+            COLORTERM: 'truecolor',
+            LANG: process.env.LANG || 'en_US.UTF-8',
+          },
+        });
+      }
+
+      // Create a new PTY instance with proper terminal settings
+      return pty.spawn(shellInfo.path, shellInfo.args || [], {
+        name: 'xterm-256color',  // Better terminal emulation
+        cwd: worktreePath,
+        cols: 80,
+        rows: 24,
+        env: {
+          ...process.env,
+          PATH: shellPath,
+          WORKTREE_PATH: worktreePath,
+          TERM: 'xterm-256color',  // Ensure TERM is set for color support
+          COLORTERM: 'truecolor',  // Enable 24-bit color
+          LANG: process.env.LANG || 'en_US.UTF-8',  // Set locale for proper character handling
+        },
+      });
+    })();
 
     // Store the session
     this.terminalSessions.set(sessionId, {
       pty: ptyProcess,
       sessionId,
       cwd: worktreePath,
+      remote,
     });
 
     // Handle data from the PTY

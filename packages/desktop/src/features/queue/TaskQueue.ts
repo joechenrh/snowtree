@@ -5,7 +5,7 @@ import { SessionManager } from '../session';
 import type { WorktreeManager } from '../worktree';
 import { WorktreeNameGenerator } from '../worktree';
 import { randomUUID } from 'crypto';
-import { join } from 'path';
+import { join, posix } from 'path';
 import type { ClaudeExecutor } from '../../executors/claude';
 import type { GitDiffManager } from '../git';
 import type { ExecutionTracker } from './ExecutionTracker';
@@ -222,9 +222,11 @@ export class TaskQueue {
           if (folderName && (folderName.startsWith('/') || folderName.includes(':'))) {
             return folderName;
           }
-          return join(targetProject.path, folderName);
+          const joinFn = targetProject.path.startsWith('/') ? posix.join : join;
+          return joinFn(targetProject.path, folderName);
         })();
-        const plannedWorktreePath = join(plannedBaseDir, worktreeName);
+        const joinFn = plannedBaseDir.startsWith('/') ? posix.join : join;
+        const plannedWorktreePath = joinFn(plannedBaseDir, worktreeName);
 
         const session = await sessionManager.createSessionWithProvidedId(
           sessionId,
@@ -286,7 +288,8 @@ export class TaskQueue {
               worktreeName = uniqueWorktreeName;
 
               // Update session with new name
-              const newPlannedWorktreePath = join(plannedBaseDir, worktreeName);
+              const updatedJoinFn = plannedBaseDir.startsWith('/') ? posix.join : join;
+              const newPlannedWorktreePath = updatedJoinFn(plannedBaseDir, worktreeName);
               sessionManager.updateSession(session.id, {
                 name: sessionName,
                 worktreePath: newPlannedWorktreePath,
@@ -342,8 +345,8 @@ export class TaskQueue {
         // Panels are created lazily when the user sends input.
         // Worktree creation commands are recorded as timeline events.
 
-        // Run build script after session is visible in UI
-        if (targetProject.build_script) {
+        // Run build script after session is visible in UI (local projects only for now)
+        if (targetProject.build_script && targetProject.location_type !== 'remote') {
           console.log(`[TaskQueue] Running build script for session ${session.id}`);
 
           // Update status message
@@ -360,6 +363,13 @@ export class TaskQueue {
           const buildCommands = targetProject.build_script.split('\n').filter(cmd => cmd.trim());
           const buildResult = await sessionManager.runBuildScript(session.id, buildCommands, worktreePath);
           console.log(`[TaskQueue] Build script completed. Success: ${buildResult.success}`);
+        } else if (targetProject.build_script && targetProject.location_type === 'remote') {
+          const buildSkippedMessage = `\x1b[36m[${formatForDisplay(new Date())}]\x1b[0m \x1b[1m\x1b[33m⚠ Skipping local build script for remote workspace.\x1b[0m\r\n\r\n`;
+          await sessionManager.addSessionOutput(session.id, {
+            type: 'stdout',
+            data: buildSkippedMessage,
+            timestamp: new Date()
+          });
         }
 
         // Only start an AI panel if there's a prompt
@@ -713,7 +723,7 @@ export class TaskQueue {
       // This handles cases where a worktree was created outside of Snowtree
       let worktreePathExists = false;
       try {
-        if (project) {
+        if (project && project.location_type !== 'remote') {
           const path = require('path');
           const fs = require('fs');
           const worktreeFolder = project.worktree_folder || 'worktrees';

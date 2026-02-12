@@ -205,7 +205,18 @@ export class API {
       return window.electronAPI.projects.getAll();
     },
 
-    async create(request: { name: string; path: string; active: boolean }) {
+    async create(request: {
+      name: string;
+      path: string;
+      active: boolean;
+      locationType?: 'local' | 'remote';
+      remoteHost?: string | null;
+      remoteUser?: string | null;
+      remotePort?: number | null;
+      remotePath?: string | null;
+      remoteAuthType?: 'ssh-agent' | 'keyfile' | null;
+      remoteKeyPath?: string | null;
+    }) {
       requireElectron();
       return window.electronAPI.projects.create(request);
     },
@@ -249,4 +260,3 @@ export class API {
     },
   };
 }
-

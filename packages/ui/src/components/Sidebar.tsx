@@ -11,6 +11,13 @@ type Project = {
   id: number;
   name: string;
   path: string;
+  location_type?: 'local' | 'remote';
+  remote_host?: string | null;
+  remote_user?: string | null;
+  remote_port?: number | null;
+  remote_path?: string | null;
+  remote_auth_type?: 'ssh-agent' | 'keyfile' | null;
+  remote_key_path?: string | null;
   active?: boolean;
 };
 
@@ -59,6 +66,15 @@ export function Sidebar() {
     const branch = typeof worktree.branch === 'string' ? worktree.branch.trim() : '';
     if (branch) return branch;
     return worktree.path.split('/').filter(Boolean).pop() || worktree.path;
+  }, []);
+
+  const getProjectPathLabel = useCallback((project: Project): string => {
+    if (project.location_type === 'remote') {
+      const host = project.remote_host || 'remote';
+      const remotePath = project.remote_path || project.path;
+      return `${host}:${remotePath}`;
+    }
+    return project.path;
   }, []);
 
   const loadProjects = useCallback(async () => {
@@ -250,6 +266,55 @@ export function Sidebar() {
       await loadProjects();
     } catch (error) {
       showError({ title: 'Failed to Add Repository', error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+  }, [loadProjects, showError]);
+
+  const handleAddRemoteRepository = useCallback(async () => {
+    try {
+      const hostInput = window.prompt('Remote SSH host (or alias from ~/.ssh/config):', '');
+      const remoteHost = hostInput?.trim() || '';
+      if (!remoteHost) return;
+
+      const pathInput = window.prompt('Remote repository absolute path:', '/home/user/repo');
+      const remotePath = pathInput?.trim() || '';
+      if (!remotePath) return;
+
+      const userInput = window.prompt('SSH user (optional):', '');
+      const remoteUser = userInput?.trim() || null;
+
+      const portInput = window.prompt('SSH port (optional):', '');
+      let remotePort: number | null = null;
+      const trimmedPort = portInput?.trim() || '';
+      if (trimmedPort) {
+        const parsed = Number.parseInt(trimmedPort, 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          showError({ title: 'Invalid SSH Port', error: `Expected a positive integer, received: ${trimmedPort}` });
+          return;
+        }
+        remotePort = parsed;
+      }
+
+      const repoName = remotePath.split('/').filter(Boolean).pop() || `${remoteHost} repo`;
+      const createRes = await API.projects.create({
+        name: repoName,
+        path: remotePath,
+        active: true,
+        locationType: 'remote',
+        remoteHost,
+        remoteUser,
+        remotePort,
+        remotePath,
+        remoteAuthType: 'ssh-agent',
+      });
+
+      if (!createRes.success) {
+        showError({ title: 'Failed to Add Remote Repository', error: createRes.error || 'Could not add remote repository' });
+        return;
+      }
+
+      await loadProjects();
+    } catch (error) {
+      showError({ title: 'Failed to Add Remote Repository', error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }, [loadProjects, showError]);
 
@@ -539,16 +604,28 @@ export function Sidebar() {
               Workspaces
             </div>
           </div>
-          <button
-            type="button"
-            onClick={handleAddRepository}
-            className="st-icon-button st-focus-ring"
-            title="Add repository"
-            // @ts-expect-error - webkit vendor prefix
-            style={{ color: 'var(--st-text-muted)', WebkitAppRegion: 'no-drag' }}
-          >
-            <FolderPlus className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-1" style={{ ['WebkitAppRegion' as never]: 'no-drag' }}>
+            <button
+              type="button"
+              onClick={handleAddRepository}
+              className="st-icon-button st-focus-ring"
+              title="Add local repository"
+              // @ts-expect-error - webkit vendor prefix
+              style={{ color: 'var(--st-text-muted)', WebkitAppRegion: 'no-drag' }}
+            >
+              <FolderPlus className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              onClick={handleAddRemoteRepository}
+              className="st-icon-button st-focus-ring"
+              title="Add remote repository (SSH)"
+              // @ts-expect-error - webkit vendor prefix
+              style={{ color: 'var(--st-text-muted)', WebkitAppRegion: 'no-drag' }}
+            >
+              <Download className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -579,7 +656,7 @@ export function Sidebar() {
                         }
                       }}
                       className="w-full flex items-center gap-2 px-2 py-2 rounded-md st-hoverable st-focus-ring"
-                      title={project.path}
+                      title={getProjectPathLabel(project)}
                       style={{ backgroundColor: 'transparent' }}
                     >
                       <button
@@ -599,7 +676,7 @@ export function Sidebar() {
                         <div className="text-sm font-medium truncate" style={{ color: 'var(--st-text)' }}>
                           {project.name}
                         </div>
-                        <div className="text-[11px] truncate st-text-faint">{project.path}</div>
+                        <div className="text-[11px] truncate st-text-faint">{getProjectPathLabel(project)}</div>
                       </div>
 
                       <div className="flex items-center gap-1 flex-shrink-0">

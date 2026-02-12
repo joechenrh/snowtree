@@ -4,6 +4,7 @@ import { getShellPath } from '../../infrastructure/command/shellPath';
 import { escapeShellArg } from '../../infrastructure/security/shellEscape';
 import type { SessionManager } from '../../features/session/SessionManager';
 import type { TimelineEvent } from '../../infrastructure/database/models';
+import type { Project } from '../../infrastructure/database/models';
 
 export type GitCommandKind = 'git.command' | 'worktree.command';
 
@@ -39,8 +40,66 @@ const formatCommandForDisplay = (argv: string[]): string =>
 
 const formatCommandForCopy = (argv: string[]): string => argv.map(escapeShellArg).join(' ');
 
+type RemoteProjectContext = {
+  host: string;
+  user: string | null;
+  port: number | null;
+  authType: 'ssh-agent' | 'keyfile' | null;
+  keyPath: string | null;
+};
+
 export class GitExecutor {
   constructor(private sessionManager: SessionManager) {}
+
+  private resolveProjectForRun(options: GitRunOptions): Project | undefined {
+    if (options.sessionId) {
+      return this.sessionManager.getProjectForSession(options.sessionId);
+    }
+    return this.sessionManager.getProjectForPath(options.cwd);
+  }
+
+  private getRemoteProjectContext(project: Project | undefined): RemoteProjectContext | null {
+    if (!project || project.location_type !== 'remote') return null;
+
+    const host = String(project.remote_host || '').trim();
+    if (!host) {
+      throw new Error('Remote project is missing host configuration');
+    }
+
+    const port = typeof project.remote_port === 'number' && Number.isFinite(project.remote_port)
+      ? project.remote_port
+      : null;
+    const authType = project.remote_auth_type || null;
+    const keyPath = typeof project.remote_key_path === 'string' && project.remote_key_path.trim()
+      ? project.remote_key_path.trim()
+      : null;
+    const user = typeof project.remote_user === 'string' && project.remote_user.trim()
+      ? project.remote_user.trim()
+      : null;
+
+    return { host, user, port, authType, keyPath };
+  }
+
+  private buildSshSpawn(remote: RemoteProjectContext, cwd: string, argv: string[]): { cmd: string; args: string[]; cwd: string } {
+    const sshArgs: string[] = ['-o', 'BatchMode=yes'];
+
+    if (typeof remote.port === 'number' && remote.port > 0) {
+      sshArgs.push('-p', String(remote.port));
+    }
+    if (remote.authType === 'keyfile' && remote.keyPath) {
+      sshArgs.push('-i', remote.keyPath);
+    }
+
+    const target = remote.user ? `${remote.user}@${remote.host}` : remote.host;
+    const remoteCommand = `cd ${escapeShellArg(cwd)} && ${formatCommandForCopy(argv)}`;
+    sshArgs.push(target, 'sh', '-lc', remoteCommand);
+
+    return {
+      cmd: 'ssh',
+      args: sshArgs,
+      cwd: process.cwd(),
+    };
+  }
 
   async run(options: GitRunOptions): Promise<GitRunResult> {
     const argv = options.argv || [];
@@ -55,6 +114,8 @@ export class GitExecutor {
     // This keeps Conversations focused on explicit operations (e.g. create/rename/remove worktree),
     // and avoids spamming the timeline with background reads (status/diff/log for UI refresh).
     const recordTimeline = Boolean(options.sessionId) && (options.recordTimeline ?? options.op === 'write');
+    const project = this.resolveProjectForRun(options);
+    const remote = this.getRemoteProjectContext(project);
     const meta = {
       ...(options.meta || {}),
       operationId,
@@ -62,6 +123,10 @@ export class GitExecutor {
       op: options.op,
       commandCopy,
       treatAsSuccessIfOutputIncludes: options.treatAsSuccessIfOutputIncludes,
+      transport: remote ? 'ssh' : 'local',
+      remoteHost: remote?.host,
+      remotePort: remote?.port,
+      remoteUser: remote?.user,
     };
 
     let startEvent: TimelineEvent | null = null;
@@ -87,11 +152,14 @@ export class GitExecutor {
       FORCE_COLOR: '0',
     } as Record<string, string>;
 
-    const cmd = argv[0];
-    const args = argv.slice(1);
+    const localCmd = argv[0];
+    const localArgs = argv.slice(1);
+    const spawnConfig = remote
+      ? this.buildSshSpawn(remote, options.cwd, argv)
+      : { cmd: localCmd, args: localArgs, cwd: options.cwd };
 
     return await new Promise<GitRunResult>((resolve, reject) => {
-      const proc = spawn(cmd, args, { cwd: options.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn(spawnConfig.cmd, spawnConfig.args, { cwd: spawnConfig.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];

@@ -8,6 +8,7 @@ import type { DatabaseService } from '../../infrastructure/database/database';
 import type { Session as DbSession, CreateSessionData, UpdateSessionData, ConversationMessage, PromptMarker, ExecutionDiff, CreateExecutionDiffData, Project, CreateTimelineEventData, TimelineEvent } from '../../infrastructure/database/models';
 import { getShellPath } from '../../infrastructure/command/shellPath';
 import { TerminalManager } from './TerminalManager';
+import type { RemoteTerminalOptions } from './TerminalManager';
 import type { BaseAIPanelState, ToolPanelState, ToolPanel } from '@snowtree/core/types/panels';
 import { formatForDisplay } from '../../infrastructure/utils/timestampUtils';
 import { scriptExecutionTracker } from '../queue/ScriptExecutionTracker';
@@ -327,6 +328,52 @@ export class SessionManager extends EventEmitter {
       return this.getProjectById(dbSession.project_id);
     }
     return undefined;
+  }
+
+  getProjectForPath(cwd: string): Project | undefined {
+    const normalizedCwd = String(cwd || '').replace(/[\\/]+$/, '');
+    if (!normalizedCwd) return undefined;
+
+    const projects = this.db.getAllProjects();
+    const sorted = [...projects].sort((a, b) => {
+      const aLen = Math.max(a.path?.length || 0, a.remote_path?.length || 0);
+      const bLen = Math.max(b.path?.length || 0, b.remote_path?.length || 0);
+      return bLen - aLen;
+    });
+
+    for (const project of sorted) {
+      const candidates = [
+        String(project.path || '').replace(/[\\/]+$/, ''),
+        String(project.remote_path || '').replace(/[\\/]+$/, ''),
+      ].filter(Boolean);
+
+      if (candidates.length === 0) continue;
+      const matches = candidates.some((basePath) =>
+        normalizedCwd === basePath ||
+        normalizedCwd.startsWith(`${basePath}/`) ||
+        normalizedCwd.startsWith(`${basePath}\\`)
+      );
+      if (
+        matches
+      ) {
+        return project;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getRemoteTerminalOptions(sessionId: string): RemoteTerminalOptions | undefined {
+    const project = this.getProjectForSession(sessionId);
+    if (!project || project.location_type !== 'remote' || !project.remote_host) return undefined;
+
+    return {
+      host: project.remote_host,
+      user: project.remote_user,
+      port: project.remote_port,
+      authType: project.remote_auth_type,
+      keyPath: project.remote_key_path,
+    };
   }
 
   initializeFromDatabase(): void {
@@ -1901,7 +1948,7 @@ export class SessionManager extends EventEmitter {
     try {
       // Create terminal session if it doesn't exist
       if (!this.terminalSessionManager.hasSession(sessionId)) {
-        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath);
+        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath, this.getRemoteTerminalOptions(sessionId));
         // Give the terminal a moment to initialize
         await new Promise(resolve => setTimeout(resolve, 100));
       }
@@ -1942,7 +1989,7 @@ export class SessionManager extends EventEmitter {
     try {
       // Create terminal session if it doesn't exist
       if (!this.terminalSessionManager.hasSession(sessionId)) {
-        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath);
+        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath, this.getRemoteTerminalOptions(sessionId));
         // Give the terminal a moment to initialize
         await new Promise(resolve => setTimeout(resolve, 100));
       }
@@ -1995,7 +2042,7 @@ export class SessionManager extends EventEmitter {
     try {
       // Create terminal session if it doesn't exist
       if (!this.terminalSessionManager.hasSession(sessionId)) {
-        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath);
+        await this.terminalSessionManager.createTerminalSession(sessionId, worktreePath, this.getRemoteTerminalOptions(sessionId));
       }
     } catch (error) {
       console.error(`[SessionManager] Failed to pre-create terminal session: ${error}`);

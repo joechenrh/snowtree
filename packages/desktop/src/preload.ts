@@ -32,7 +32,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   projects: {
     getAll: (): Promise<IPCResponse> => ipcRenderer.invoke('projects:get-all'),
-    create: (request: { name: string; path: string; active: boolean }): Promise<IPCResponse> =>
+    create: (request: {
+      name: string;
+      path: string;
+      active: boolean;
+      locationType?: 'local' | 'remote';
+      remoteHost?: string | null;
+      remoteUser?: string | null;
+      remotePort?: number | null;
+      remotePath?: string | null;
+      remoteAuthType?: 'ssh-agent' | 'keyfile' | null;
+      remoteKeyPath?: string | null;
+    }): Promise<IPCResponse> =>
       ipcRenderer.invoke('projects:create', request),
     delete: (projectId: number): Promise<IPCResponse> => ipcRenderer.invoke('projects:delete', projectId),
     getWorktrees: (projectId: number, sessionId?: string | null): Promise<IPCResponse> =>

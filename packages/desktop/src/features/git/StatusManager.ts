@@ -192,6 +192,12 @@ export class GitStatusManager extends EventEmitter {
   private async startWatchingSession(sessionId: string): Promise<void> {
     this.logger?.verbose(`[GitStatus] startWatchingSession called for ${sessionId}`);
     try {
+      const project = this.sessionManager.getProjectForSession(sessionId);
+      if (project?.location_type === 'remote') {
+        this.logger?.verbose(`[GitStatus] Skipping local file watch for remote session ${sessionId}`);
+        return;
+      }
+
       const session = await this.sessionManager.getSession(sessionId);
       this.logger?.verbose(`[GitStatus] Got session for ${sessionId}: worktreePath=${session?.worktreePath}`);
       if (session?.worktreePath) {

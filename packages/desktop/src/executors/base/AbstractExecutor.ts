@@ -16,7 +16,9 @@ import { promisify } from 'util';
 import type { Logger } from '../../infrastructure/logging/logger';
 import type { ConfigManager } from '../../infrastructure/config/configManager';
 import type { SessionManager } from '../../features/session/SessionManager';
+import type { Project } from '../../infrastructure/database/models';
 import { getShellPath } from '../../infrastructure/command/shellPath';
+import { escapeShellArg } from '../../infrastructure/security/shellEscape';
 import { findNodeExecutable } from '../../infrastructure/utils/nodeFinder';
 import { cliLogger } from '../../infrastructure/logging/cliLogger';
 import type { CliTool } from '../../infrastructure/logging/cliLogger';
@@ -40,6 +42,14 @@ const execAsync = promisify(exec);
 interface AvailabilityCache {
   result: ExecutorAvailability;
   timestamp: number;
+}
+
+interface RemoteExecutionContext {
+  host: string;
+  user: string | null;
+  port: number | null;
+  authType: 'ssh-agent' | 'keyfile' | null;
+  keyPath: string | null;
 }
 
 /**
@@ -170,24 +180,91 @@ export abstract class AbstractExecutor extends EventEmitter {
     } as Record<string, string>;
   }
 
+  private resolveProjectForSession(sessionId: string): Project | undefined {
+    return this.sessionManager.getProjectForSession(sessionId);
+  }
+
+  private getRemoteExecutionContext(project: Project | undefined): RemoteExecutionContext | null {
+    if (!project || project.location_type !== 'remote') return null;
+
+    const host = String(project.remote_host || '').trim();
+    if (!host) {
+      throw new Error('Remote project is missing host configuration');
+    }
+
+    const user = typeof project.remote_user === 'string' && project.remote_user.trim()
+      ? project.remote_user.trim()
+      : null;
+    const port = typeof project.remote_port === 'number' && Number.isFinite(project.remote_port)
+      ? project.remote_port
+      : null;
+    const authType = project.remote_auth_type || null;
+    const keyPath = typeof project.remote_key_path === 'string' && project.remote_key_path.trim()
+      ? project.remote_key_path.trim()
+      : null;
+
+    return { host, user, port, authType, keyPath };
+  }
+
+  private buildRemoteShellScript(
+    remoteCwd: string,
+    command: string,
+    args: string[],
+    remoteEnv: Record<string, string>
+  ): string {
+    const envAssignments = Object.entries(remoteEnv)
+      .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
+      .map(([key, value]) => `${key}=${escapeShellArg(String(value))}`)
+      .join(' ');
+    const commandTokens = [command, ...args].map((token) => escapeShellArg(token)).join(' ');
+
+    return `cd ${escapeShellArg(remoteCwd)} && ${envAssignments ? `${envAssignments} ` : ''}${commandTokens}`;
+  }
+
+  private buildSshArgs(remote: RemoteExecutionContext, remoteScript: string): string[] {
+    const args: string[] = ['-o', 'BatchMode=yes'];
+    if (typeof remote.port === 'number' && remote.port > 0) {
+      args.push('-p', String(remote.port));
+    }
+    if (remote.authType === 'keyfile' && remote.keyPath) {
+      args.push('-i', remote.keyPath);
+    }
+
+    const target = remote.user ? `${remote.user}@${remote.host}` : remote.host;
+    args.push(target, 'sh', '-lc', remoteScript);
+    return args;
+  }
+
   /** Spawn a CLI process */
   async spawn(options: ExecutorSpawnOptions): Promise<void> {
     const { panelId, sessionId, worktreePath, prompt, isResume } = options;
     const tool = this.getCliLogType();
 
     try {
-      // Check availability
-      const availability = await this.getCachedAvailability();
-      if (!availability.available) {
-        await this.handleNotAvailable(availability, panelId, sessionId);
-        throw new Error(`${this.getToolName()} not available: ${availability.error}`);
+      const project = this.resolveProjectForSession(sessionId);
+      const remoteExecution = this.getRemoteExecutionContext(project);
+
+      if (!remoteExecution) {
+        // Check local availability only for local sessions.
+        const availability = await this.getCachedAvailability();
+        if (!availability.available) {
+          await this.handleNotAvailable(availability, panelId, sessionId);
+          throw new Error(`${this.getToolName()} not available: ${availability.error}`);
+        }
       }
 
       // Build command
       const args = this.buildCommandArgs(options);
       const cliEnv = await this.initializeEnvironment(options);
       const systemEnv = await this.getSystemEnvironment();
-      const env = { ...systemEnv, ...cliEnv };
+      const env = remoteExecution
+        ? ({
+            ...process.env,
+            PATH: getShellPath(),
+            NO_COLOR: '1',
+            FORCE_COLOR: '0',
+          } as Record<string, string>)
+        : { ...systemEnv, ...cliEnv };
       const command = await this.getExecutablePath();
 
       const operationId = randomUUID();
@@ -225,13 +302,17 @@ export abstract class AbstractExecutor extends EventEmitter {
           cliCommand: command,
           cliArgs: args,
           cliIsResume: Boolean(isResume),
+          executionTransport: remoteExecution ? 'ssh' : 'local',
+          remoteHost: remoteExecution?.host,
+          remotePort: remoteExecution?.port,
+          remoteUser: remoteExecution?.user,
           ...runtimeMeta,
         }
       });
 
       const transport = this.getSpawnTransport();
       if (transport === 'pty') {
-        const ptyProcess = await this.spawnPtyProcess(command, args, worktreePath, env);
+        const ptyProcess = await this.spawnPtyProcess(command, args, worktreePath, env, remoteExecution, cliEnv);
         const executorProcess: ExecutorProcess = {
           transport: 'pty',
           pty: ptyProcess,
@@ -242,7 +323,7 @@ export abstract class AbstractExecutor extends EventEmitter {
         this.processes.set(panelId, executorProcess);
         this.setupPtyProcessHandlers(ptyProcess, panelId, sessionId);
       } else {
-        const child = await this.spawnStdioProcess(command, args, worktreePath, env);
+        const child = await this.spawnStdioProcess(command, args, worktreePath, env, remoteExecution, cliEnv);
         const executorProcess: ExecutorProcess = {
           transport: 'stdio',
           child,
@@ -302,10 +383,28 @@ export abstract class AbstractExecutor extends EventEmitter {
     command: string,
     args: string[],
     cwd: string,
-    env: Record<string, string>
+    env: Record<string, string>,
+    remote?: RemoteExecutionContext | null,
+    remoteEnv?: Record<string, string>
   ): Promise<pty.IPty> {
     if (!pty) {
       throw new Error('node-pty not available');
+    }
+
+    if (remote) {
+      const remoteScript = this.buildRemoteShellScript(cwd, command, args, remoteEnv || {});
+      const sshArgs = this.buildSshArgs(remote, remoteScript);
+
+      this.logger?.verbose(`Executing over SSH: ssh ${sshArgs.join(' ')}`);
+      this.logger?.verbose(`Remote working directory: ${cwd}`);
+
+      return pty.spawn('ssh', sshArgs, {
+        name: 'xterm-color',
+        cols: 80,
+        rows: 30,
+        cwd: process.cwd(),
+        env,
+      });
     }
 
     // Validate working directory exists before spawning
@@ -458,8 +557,33 @@ export abstract class AbstractExecutor extends EventEmitter {
     command: string,
     args: string[],
     cwd: string,
-    env: Record<string, string>
+    env: Record<string, string>,
+    remote?: RemoteExecutionContext | null,
+    remoteEnv?: Record<string, string>
   ): Promise<ChildProcessWithoutNullStreams> {
+    if (remote) {
+      const remoteScript = this.buildRemoteShellScript(cwd, command, args, remoteEnv || {});
+      const sshArgs = this.buildSshArgs(remote, remoteScript);
+
+      this.logger?.verbose(`Executing over SSH (stdio): ssh ${sshArgs.join(' ')}`);
+      this.logger?.verbose(`Remote working directory: ${cwd}`);
+
+      const child = spawnChild('ssh', sshArgs, {
+        cwd: process.cwd(),
+        env,
+        stdio: 'pipe',
+        detached: process.platform !== 'win32',
+      });
+
+      if (!child.stdout || !child.stderr || !child.stdin) {
+        throw new Error('Failed to spawn SSH process with piped stdio');
+      }
+
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      return child;
+    }
+
     // Validate working directory exists before spawning
     if (!fs.existsSync(cwd)) {
       throw new Error(

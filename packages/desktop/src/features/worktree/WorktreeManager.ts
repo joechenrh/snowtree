@@ -1,4 +1,4 @@
-import { join } from 'path';
+import { join, posix } from 'path';
 import { mkdir, stat } from 'fs/promises';
 import { withLock } from '../../infrastructure/utils/mutex';
 import type { GitExecutor, GitOperationType } from '../../executors/git';
@@ -50,7 +50,8 @@ export class WorktreeManager {
     if (!this.projectsCache.has(cacheKey)) {
       const folderName = worktreeFolder || 'worktrees';
       const isAbsolute = Boolean(worktreeFolder && (worktreeFolder.startsWith('/') || worktreeFolder.includes(':')));
-      const baseDir = isAbsolute ? folderName : join(projectPath, folderName);
+      const joinFn = projectPath.startsWith('/') ? posix.join : join;
+      const baseDir = isAbsolute ? folderName : joinFn(projectPath, folderName);
       this.projectsCache.set(cacheKey, { baseDir });
     }
     return this.projectsCache.get(cacheKey)!;
@@ -58,7 +59,29 @@ export class WorktreeManager {
 
   async initializeProject(projectPath: string, worktreeFolder?: string): Promise<void> {
     const { baseDir } = this.getProjectPaths(projectPath, worktreeFolder);
-    await mkdir(baseDir, { recursive: true });
+    await this.ensureBaseDir(projectPath, baseDir);
+  }
+
+  private async ensureBaseDir(projectPath: string, baseDir: string, sessionId?: string): Promise<void> {
+    try {
+      await mkdir(baseDir, { recursive: true });
+      return;
+    } catch {
+      // The path may be remote or unavailable locally. Try creating it via command execution.
+    }
+
+    try {
+      await this.runGit({
+        sessionId,
+        cwd: projectPath,
+        argv: ['mkdir', '-p', baseDir],
+        op: 'write',
+        throwOnError: false,
+        meta: { source: 'worktree', operation: 'mkdir-base-dir', baseDir },
+      });
+    } catch {
+      // Best effort: subsequent git commands will provide clearer errors if creation truly failed.
+    }
   }
 
   async createWorktree(
@@ -71,9 +94,10 @@ export class WorktreeManager {
   ): Promise<{ worktreePath: string; baseCommit: string; baseBranch: string; branchName: string }> {
     return await withLock(`worktree-create-${projectPath}-${name}`, async () => {
       const { baseDir } = this.getProjectPaths(projectPath, worktreeFolder);
-      await mkdir(baseDir, { recursive: true });
+      await this.ensureBaseDir(projectPath, baseDir, sessionId);
 
-      const worktreePath = join(baseDir, name);
+      const joinFn = baseDir.startsWith('/') ? posix.join : join;
+      const worktreePath = joinFn(baseDir, name);
       const branchName = branch || name;
 
       // Ensure we have a git repo. If not, initialize and create an initial commit.

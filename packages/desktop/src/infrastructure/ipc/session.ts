@@ -55,6 +55,12 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     if (!session?.worktreePath) return null;
 
     let worktreePath = session.worktreePath;
+    const project = session.projectId ? databaseService.getProject(session.projectId) : null;
+
+    // Remote workspaces are not available on the local filesystem; skip local existence checks.
+    if (project?.location_type === 'remote') {
+      return worktreePath;
+    }
 
     // If path exists, no recovery needed
     if (fs.existsSync(worktreePath)) {
@@ -66,7 +72,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     const worktreeName = dbSession?.worktree_name;
 
     // Try to find the worktree by branch name
-    const project = session.projectId ? databaseService.getProject(session.projectId) : null;
     if (!project || !worktreeName) {
       return null;
     }

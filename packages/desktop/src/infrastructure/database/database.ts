@@ -47,6 +47,16 @@ interface ExecutionDiffRow {
   timestamp: string;
 }
 
+export interface RemoteProjectConfig {
+  locationType?: 'local' | 'remote';
+  remoteHost?: string | null;
+  remoteUser?: string | null;
+  remotePort?: number | null;
+  remotePath?: string | null;
+  remoteAuthType?: 'ssh-agent' | 'keyfile' | null;
+  remoteKeyPath?: string | null;
+}
+
 export class DatabaseService {
   private db: Database.Database;
 
@@ -125,6 +135,7 @@ export class DatabaseService {
 
     const migrations: Migration[] = [
       { version: 1, name: 'add_execution_mode', run: () => this.migrate_001_add_execution_mode() },
+      { version: 2, name: 'add_remote_project_fields', run: () => this.migrate_002_add_remote_project_fields() },
       // Future migrations go here
     ];
 
@@ -148,6 +159,7 @@ export class DatabaseService {
 
     // Final safety pass: ensure critical columns exist
     this.ensureSessionsTableColumns();
+    this.ensureProjectsTableColumns();
   }
 
   private ensureMigrationsTable(): void {
@@ -187,6 +199,36 @@ export class DatabaseService {
       this.db.prepare("ALTER TABLE sessions ADD COLUMN execution_mode TEXT DEFAULT 'execute'").run();
     }
   }
+
+  // Migration 002: Add remote project metadata to projects table
+  private migrate_002_add_remote_project_fields(): void {
+    interface SqliteTableInfo {
+      cid: number;
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+      pk: number;
+    }
+
+    const tableInfo = this.db.prepare("PRAGMA table_info(projects)").all() as SqliteTableInfo[];
+    const existing = new Set(tableInfo.map((col: SqliteTableInfo) => col.name));
+
+    const addColumnIfMissing = (columnName: string, sql: string) => {
+      if (!existing.has(columnName)) {
+        this.db.prepare(sql).run();
+      }
+    };
+
+    addColumnIfMissing('location_type', "ALTER TABLE projects ADD COLUMN location_type TEXT DEFAULT 'local'");
+    addColumnIfMissing('remote_host', 'ALTER TABLE projects ADD COLUMN remote_host TEXT');
+    addColumnIfMissing('remote_user', 'ALTER TABLE projects ADD COLUMN remote_user TEXT');
+    addColumnIfMissing('remote_port', 'ALTER TABLE projects ADD COLUMN remote_port INTEGER');
+    addColumnIfMissing('remote_path', 'ALTER TABLE projects ADD COLUMN remote_path TEXT');
+    addColumnIfMissing('remote_auth_type', "ALTER TABLE projects ADD COLUMN remote_auth_type TEXT DEFAULT 'ssh-agent'");
+    addColumnIfMissing('remote_key_path', 'ALTER TABLE projects ADD COLUMN remote_key_path TEXT');
+  }
+
   private ensureSessionsTableColumns(): void {
     interface SqliteTableInfo {
       cid: number;
@@ -220,6 +262,52 @@ export class DatabaseService {
 
     if (!existing.has('execution_mode')) {
       addColumnBestEffort("ALTER TABLE sessions ADD COLUMN execution_mode TEXT DEFAULT 'execute'", 'execution_mode');
+    }
+  }
+
+  private ensureProjectsTableColumns(): void {
+    interface SqliteTableInfo {
+      cid: number;
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+      pk: number;
+    }
+
+    const columns = this.db.prepare("PRAGMA table_info(projects)").all() as SqliteTableInfo[];
+    const existing = new Set(columns.map((col) => col.name));
+
+    const addColumnBestEffort = (sql: string, columnName: string) => {
+      try {
+        this.db.prepare(sql).run();
+        console.log(`[Database] Added missing ${columnName} column to projects table`);
+      } catch (error) {
+        // Best-effort: don't block startup; logs help diagnose DBs in the wild.
+        console.warn(`[Database] Failed to add missing ${columnName} column to projects table:`, error);
+      }
+    };
+
+    if (!existing.has('location_type')) {
+      addColumnBestEffort("ALTER TABLE projects ADD COLUMN location_type TEXT DEFAULT 'local'", 'location_type');
+    }
+    if (!existing.has('remote_host')) {
+      addColumnBestEffort('ALTER TABLE projects ADD COLUMN remote_host TEXT', 'remote_host');
+    }
+    if (!existing.has('remote_user')) {
+      addColumnBestEffort('ALTER TABLE projects ADD COLUMN remote_user TEXT', 'remote_user');
+    }
+    if (!existing.has('remote_port')) {
+      addColumnBestEffort('ALTER TABLE projects ADD COLUMN remote_port INTEGER', 'remote_port');
+    }
+    if (!existing.has('remote_path')) {
+      addColumnBestEffort('ALTER TABLE projects ADD COLUMN remote_path TEXT', 'remote_path');
+    }
+    if (!existing.has('remote_auth_type')) {
+      addColumnBestEffort("ALTER TABLE projects ADD COLUMN remote_auth_type TEXT DEFAULT 'ssh-agent'", 'remote_auth_type');
+    }
+    if (!existing.has('remote_key_path')) {
+      addColumnBestEffort('ALTER TABLE projects ADD COLUMN remote_key_path TEXT', 'remote_key_path');
     }
   }
 
@@ -294,7 +382,19 @@ export class DatabaseService {
   }
 
   // Project operations
-  createProject(name: string, path: string, systemPrompt?: string, runScript?: string, buildScript?: string, defaultPermissionMode?: 'approve' | 'ignore', openIdeCommand?: string, commitMode?: 'structured' | 'checkpoint' | 'disabled', commitStructuredPromptTemplate?: string, commitCheckpointPrefix?: string): Project {
+  createProject(
+    name: string,
+    path: string,
+    systemPrompt?: string,
+    runScript?: string,
+    buildScript?: string,
+    defaultPermissionMode?: 'approve' | 'ignore',
+    openIdeCommand?: string,
+    commitMode?: 'structured' | 'checkpoint' | 'disabled',
+    commitStructuredPromptTemplate?: string,
+    commitCheckpointPrefix?: string,
+    remoteConfig?: RemoteProjectConfig
+  ): Project {
     // Get the max display_order for projects
     const maxOrderResult = this.db.prepare(`
       SELECT MAX(display_order) as max_order 
@@ -303,10 +403,40 @@ export class DatabaseService {
     
     const displayOrder = (maxOrderResult?.max_order ?? -1) + 1;
     
+    const locationType = remoteConfig?.locationType ?? 'local';
+    const remoteHost = locationType === 'remote' ? (remoteConfig?.remoteHost ?? null) : null;
+    const remoteUser = locationType === 'remote' ? (remoteConfig?.remoteUser ?? null) : null;
+    const remotePort = locationType === 'remote' ? (remoteConfig?.remotePort ?? null) : null;
+    const remotePath = locationType === 'remote' ? (remoteConfig?.remotePath ?? path) : null;
+    const remoteAuthType = locationType === 'remote' ? (remoteConfig?.remoteAuthType ?? 'ssh-agent') : null;
+    const remoteKeyPath = locationType === 'remote' ? (remoteConfig?.remoteKeyPath ?? null) : null;
+
     const result = this.db.prepare(`
-      INSERT INTO projects (name, path, system_prompt, run_script, build_script, default_permission_mode, open_ide_command, display_order, commit_mode, commit_structured_prompt_template, commit_checkpoint_prefix)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(name, path, systemPrompt || null, runScript || null, buildScript || null, defaultPermissionMode || 'ignore', openIdeCommand || null, displayOrder, commitMode || 'checkpoint', commitStructuredPromptTemplate || null, commitCheckpointPrefix || 'checkpoint: ');
+      INSERT INTO projects (
+        name, path, location_type, remote_host, remote_user, remote_port, remote_path, remote_auth_type, remote_key_path,
+        system_prompt, run_script, build_script, default_permission_mode, open_ide_command, display_order, commit_mode, commit_structured_prompt_template, commit_checkpoint_prefix
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      name,
+      path,
+      locationType,
+      remoteHost,
+      remoteUser,
+      remotePort,
+      remotePath,
+      remoteAuthType,
+      remoteKeyPath,
+      systemPrompt || null,
+      runScript || null,
+      buildScript || null,
+      defaultPermissionMode || 'ignore',
+      openIdeCommand || null,
+      displayOrder,
+      commitMode || 'checkpoint',
+      commitStructuredPromptTemplate || null,
+      commitCheckpointPrefix || 'checkpoint: '
+    );
     
     const project = this.getProject(result.lastInsertRowid as number);
     if (!project) {
@@ -342,6 +472,34 @@ export class DatabaseService {
     if (updates.path !== undefined) {
       fields.push('path = ?');
       values.push(updates.path);
+    }
+    if (updates.location_type !== undefined) {
+      fields.push('location_type = ?');
+      values.push(updates.location_type);
+    }
+    if (updates.remote_host !== undefined) {
+      fields.push('remote_host = ?');
+      values.push(updates.remote_host);
+    }
+    if (updates.remote_user !== undefined) {
+      fields.push('remote_user = ?');
+      values.push(updates.remote_user);
+    }
+    if (updates.remote_port !== undefined) {
+      fields.push('remote_port = ?');
+      values.push(updates.remote_port);
+    }
+    if (updates.remote_path !== undefined) {
+      fields.push('remote_path = ?');
+      values.push(updates.remote_path);
+    }
+    if (updates.remote_auth_type !== undefined) {
+      fields.push('remote_auth_type = ?');
+      values.push(updates.remote_auth_type);
+    }
+    if (updates.remote_key_path !== undefined) {
+      fields.push('remote_key_path = ?');
+      values.push(updates.remote_key_path);
     }
     if (updates.system_prompt !== undefined) {
       fields.push('system_prompt = ?');

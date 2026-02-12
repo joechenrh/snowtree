@@ -6,6 +6,13 @@ type CreateProjectRequest = {
   name: string;
   path: string;
   active: boolean;
+  locationType?: 'local' | 'remote';
+  remoteHost?: string | null;
+  remoteUser?: string | null;
+  remotePort?: number | null;
+  remotePath?: string | null;
+  remoteAuthType?: 'ssh-agent' | 'keyfile' | null;
+  remoteKeyPath?: string | null;
 };
 
 export function registerProjectHandlers(ipcMain: IpcMain, services: AppServices): void {
@@ -22,7 +29,34 @@ export function registerProjectHandlers(ipcMain: IpcMain, services: AppServices)
 
   ipcMain.handle('projects:create', async (_event, projectData: CreateProjectRequest) => {
     try {
-      const project = databaseService.createProject(projectData.name, projectData.path);
+      if (projectData.locationType === 'remote') {
+        const host = typeof projectData.remoteHost === 'string' ? projectData.remoteHost.trim() : '';
+        const remotePath = typeof projectData.remotePath === 'string' ? projectData.remotePath.trim() : '';
+        if (!host) return { success: false, error: 'Remote host is required' };
+        if (!remotePath) return { success: false, error: 'Remote repository path is required' };
+      }
+
+      const project = databaseService.createProject(
+        projectData.name,
+        projectData.path,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          locationType: projectData.locationType,
+          remoteHost: projectData.remoteHost,
+          remoteUser: projectData.remoteUser,
+          remotePort: projectData.remotePort,
+          remotePath: projectData.remotePath,
+          remoteAuthType: projectData.remoteAuthType,
+          remoteKeyPath: projectData.remoteKeyPath,
+        }
+      );
       if (projectData.active) {
         databaseService.setActiveProject(project.id);
         sessionManager.setActiveProject(project);
