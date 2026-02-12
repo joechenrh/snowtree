@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ChevronDown, FolderPlus, Plus, Trash2, Loader2, Download, RotateCw, Sun, Moon } from 'lucide-react';
 import { API } from '../utils/api';
 import { useErrorStore } from '../stores/errorStore';
@@ -37,6 +37,24 @@ type Worktree = {
   filesChanged: number;
 };
 
+type RemoteRepositoryFormState = {
+  host: string;
+  path: string;
+  user: string;
+  port: string;
+  authType: 'ssh-agent' | 'keyfile';
+  keyPath: string;
+};
+
+const createDefaultRemoteRepositoryForm = (): RemoteRepositoryFormState => ({
+  host: '',
+  path: '/home/user/repo',
+  user: '',
+  port: '',
+  authType: 'ssh-agent',
+  keyPath: '',
+});
+
 export function Sidebar() {
   const { showError } = useErrorStore();
   const { sessions, activeSessionId, setActiveSession } = useSessionStore();
@@ -59,6 +77,11 @@ export function Sidebar() {
   const [updateDownloaded, setUpdateDownloaded] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateError, setUpdateError] = useState<string>('');
+  const [isRemoteModalOpen, setIsRemoteModalOpen] = useState(false);
+  const [isCreatingRemoteRepo, setIsCreatingRemoteRepo] = useState(false);
+  const [remoteRepositoryForm, setRemoteRepositoryForm] = useState<RemoteRepositoryFormState>(() =>
+    createDefaultRemoteRepositoryForm()
+  );
   const sidebarPollingTimerRef = useRef<number | null>(null);
   const worktreePollInFlightRef = useRef<Set<number>>(new Set());
 
@@ -269,31 +292,57 @@ export function Sidebar() {
     }
   }, [loadProjects, showError]);
 
-  const handleAddRemoteRepository = useCallback(async () => {
-    try {
-      const hostInput = window.prompt('Remote SSH host (or alias from ~/.ssh/config):', '');
-      const remoteHost = hostInput?.trim() || '';
-      if (!remoteHost) return;
+  const handleAddRemoteRepository = useCallback(() => {
+    setRemoteRepositoryForm(createDefaultRemoteRepositoryForm());
+    setIsRemoteModalOpen(true);
+  }, []);
 
-      const pathInput = window.prompt('Remote repository absolute path:', '/home/user/repo');
-      const remotePath = pathInput?.trim() || '';
-      if (!remotePath) return;
+  const handleCloseRemoteModal = useCallback(() => {
+    if (isCreatingRemoteRepo) return;
+    setIsRemoteModalOpen(false);
+  }, [isCreatingRemoteRepo]);
 
-      const userInput = window.prompt('SSH user (optional):', '');
-      const remoteUser = userInput?.trim() || null;
+  const handleSubmitRemoteRepository = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (isCreatingRemoteRepo) return;
 
-      const portInput = window.prompt('SSH port (optional):', '');
-      let remotePort: number | null = null;
-      const trimmedPort = portInput?.trim() || '';
-      if (trimmedPort) {
-        const parsed = Number.parseInt(trimmedPort, 10);
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-          showError({ title: 'Invalid SSH Port', error: `Expected a positive integer, received: ${trimmedPort}` });
-          return;
-        }
-        remotePort = parsed;
+    const remoteHost = remoteRepositoryForm.host.trim();
+    if (!remoteHost) {
+      showError({ title: 'Invalid Remote Host', error: 'Remote SSH host is required.' });
+      return;
+    }
+
+    const remotePath = remoteRepositoryForm.path.trim();
+    if (!remotePath) {
+      showError({ title: 'Invalid Remote Path', error: 'Remote repository path is required.' });
+      return;
+    }
+
+    const remoteUser = remoteRepositoryForm.user.trim() || null;
+    const trimmedPort = remoteRepositoryForm.port.trim();
+    let remotePort: number | null = null;
+    if (trimmedPort) {
+      if (!/^\d+$/.test(trimmedPort)) {
+        showError({ title: 'Invalid SSH Port', error: `Expected a positive integer, received: ${trimmedPort}` });
+        return;
       }
+      const parsed = Number.parseInt(trimmedPort, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) {
+        showError({ title: 'Invalid SSH Port', error: `SSH port must be between 1 and 65535, received: ${trimmedPort}` });
+        return;
+      }
+      remotePort = parsed;
+    }
 
+    const remoteAuthType = remoteRepositoryForm.authType;
+    const remoteKeyPath = remoteAuthType === 'keyfile' ? remoteRepositoryForm.keyPath.trim() : '';
+    if (remoteAuthType === 'keyfile' && !remoteKeyPath) {
+      showError({ title: 'Missing SSH Key Path', error: 'SSH key path is required when using key file authentication.' });
+      return;
+    }
+
+    try {
+      setIsCreatingRemoteRepo(true);
       const repoName = remotePath.split('/').filter(Boolean).pop() || `${remoteHost} repo`;
       const createRes = await API.projects.create({
         name: repoName,
@@ -304,7 +353,8 @@ export function Sidebar() {
         remoteUser,
         remotePort,
         remotePath,
-        remoteAuthType: 'ssh-agent',
+        remoteAuthType,
+        remoteKeyPath: remoteAuthType === 'keyfile' ? remoteKeyPath : null,
       });
 
       if (!createRes.success) {
@@ -313,10 +363,14 @@ export function Sidebar() {
       }
 
       await loadProjects();
+      setIsRemoteModalOpen(false);
+      setRemoteRepositoryForm(createDefaultRemoteRepositoryForm());
     } catch (error) {
       showError({ title: 'Failed to Add Remote Repository', error: error instanceof Error ? error.message : 'Unknown error' });
+    } finally {
+      setIsCreatingRemoteRepo(false);
     }
-  }, [loadProjects, showError]);
+  }, [isCreatingRemoteRepo, loadProjects, remoteRepositoryForm, showError]);
 
   const handleNewWorkspace = useCallback(async (projectId: number) => {
     try {
@@ -937,6 +991,163 @@ export function Sidebar() {
           </div>
         )}
       </div>
+      {isRemoteModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Add remote repository"
+        >
+          <form
+            onSubmit={(event) => void handleSubmitRemoteRepository(event)}
+            className="w-full max-w-lg rounded-xl border shadow-2xl overflow-hidden"
+            style={{
+              borderColor: 'color-mix(in srgb, var(--st-border) 70%, transparent)',
+              backgroundColor: 'var(--st-surface)',
+              color: 'var(--st-text)',
+            }}
+          >
+            <div
+              className="px-4 py-3 border-b"
+              style={{ borderColor: 'color-mix(in srgb, var(--st-border) 70%, transparent)' }}
+            >
+              <div className="text-sm font-medium">Add remote repository (SSH)</div>
+            </div>
+            <div className="p-4 space-y-3">
+              <label className="block">
+                <div className="text-xs mb-1 st-text-faint">Host</div>
+                <input
+                  autoFocus
+                  type="text"
+                  value={remoteRepositoryForm.host}
+                  onChange={(e) => setRemoteRepositoryForm((prev) => ({ ...prev, host: e.target.value }))}
+                  placeholder="server.example.com"
+                  className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                  style={{
+                    backgroundColor: 'var(--st-editor)',
+                    color: 'var(--st-text)',
+                    border: '1px solid var(--st-border-variant)',
+                  }}
+                  required
+                />
+              </label>
+              <label className="block">
+                <div className="text-xs mb-1 st-text-faint">Remote path</div>
+                <input
+                  type="text"
+                  value={remoteRepositoryForm.path}
+                  onChange={(e) => setRemoteRepositoryForm((prev) => ({ ...prev, path: e.target.value }))}
+                  placeholder="/home/user/repo"
+                  className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                  style={{
+                    backgroundColor: 'var(--st-editor)',
+                    color: 'var(--st-text)',
+                    border: '1px solid var(--st-border-variant)',
+                  }}
+                  required
+                />
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <div className="text-xs mb-1 st-text-faint">User (optional)</div>
+                  <input
+                    type="text"
+                    value={remoteRepositoryForm.user}
+                    onChange={(e) => setRemoteRepositoryForm((prev) => ({ ...prev, user: e.target.value }))}
+                    placeholder="ubuntu"
+                    className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                    style={{
+                      backgroundColor: 'var(--st-editor)',
+                      color: 'var(--st-text)',
+                      border: '1px solid var(--st-border-variant)',
+                    }}
+                  />
+                </label>
+                <label className="block">
+                  <div className="text-xs mb-1 st-text-faint">Port (optional)</div>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={remoteRepositoryForm.port}
+                    onChange={(e) => setRemoteRepositoryForm((prev) => ({ ...prev, port: e.target.value }))}
+                    placeholder="22"
+                    className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                    style={{
+                      backgroundColor: 'var(--st-editor)',
+                      color: 'var(--st-text)',
+                      border: '1px solid var(--st-border-variant)',
+                    }}
+                  />
+                </label>
+              </div>
+              <label className="block">
+                <div className="text-xs mb-1 st-text-faint">Authentication</div>
+                <select
+                  value={remoteRepositoryForm.authType}
+                  onChange={(e) =>
+                    setRemoteRepositoryForm((prev) => ({
+                      ...prev,
+                      authType: e.target.value === 'keyfile' ? 'keyfile' : 'ssh-agent',
+                    }))
+                  }
+                  className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                  style={{
+                    backgroundColor: 'var(--st-editor)',
+                    color: 'var(--st-text)',
+                    border: '1px solid var(--st-border-variant)',
+                  }}
+                >
+                  <option value="ssh-agent">SSH agent</option>
+                  <option value="keyfile">Key file</option>
+                </select>
+              </label>
+              {remoteRepositoryForm.authType === 'keyfile' && (
+                <label className="block">
+                  <div className="text-xs mb-1 st-text-faint">SSH key path</div>
+                  <input
+                    type="text"
+                    value={remoteRepositoryForm.keyPath}
+                    onChange={(e) => setRemoteRepositoryForm((prev) => ({ ...prev, keyPath: e.target.value }))}
+                    placeholder="~/.ssh/id_ed25519"
+                    className="w-full text-sm rounded px-2.5 py-2 outline-none st-focus-ring"
+                    style={{
+                      backgroundColor: 'var(--st-editor)',
+                      color: 'var(--st-text)',
+                      border: '1px solid var(--st-border-variant)',
+                    }}
+                    required
+                  />
+                </label>
+              )}
+            </div>
+            <div
+              className="px-4 py-3 border-t flex items-center justify-end gap-2"
+              style={{ borderColor: 'color-mix(in srgb, var(--st-border) 70%, transparent)' }}
+            >
+              <button
+                type="button"
+                onClick={handleCloseRemoteModal}
+                disabled={isCreatingRemoteRepo}
+                className="text-sm rounded px-3 py-1.5 st-hoverable st-focus-ring disabled:opacity-50"
+                style={{ color: 'var(--st-text-muted)' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isCreatingRemoteRepo}
+                className="text-sm rounded px-3 py-1.5 st-focus-ring disabled:opacity-50"
+                style={{
+                  backgroundColor: 'var(--st-accent)',
+                  color: 'var(--st-accent-foreground)',
+                }}
+              >
+                {isCreatingRemoteRepo ? 'Adding…' : 'Add repository'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

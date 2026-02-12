@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Sidebar } from './Sidebar';
 
 vi.mock('../utils/timestampUtils', () => ({
@@ -30,6 +30,7 @@ vi.mock('../utils/api', () => ({
     projects: {
       getAll: vi.fn(),
       getWorktrees: vi.fn(),
+      create: vi.fn(),
     },
     dialog: {
       openDirectory: vi.fn(),
@@ -88,5 +89,15 @@ describe('Sidebar worktree row layout', () => {
     // Diff counters still render and are not affected by moving time.
     expect(screen.getByText('+11')).toBeInTheDocument();
     expect(screen.getByText('-14')).toBeInTheDocument();
+  });
+
+  it('opens remote repository dialog from sidebar action', async () => {
+    render(<Sidebar />);
+
+    const button = await screen.findByTitle('Add remote repository (SSH)');
+    fireEvent.click(button);
+
+    expect(screen.getByRole('dialog', { name: 'Add remote repository' })).toBeInTheDocument();
+    expect(screen.getByText('Add remote repository (SSH)')).toBeInTheDocument();
   });
 });
